@@ -7,6 +7,10 @@
 去重：段内 DP 只走规范形路径（同一间隙段内参考侧间隙在待校核侧间隙之前），
 多标志层分段组合按同一签名兜底去重；计数仍封顶 9999、最多列出前 100 条。
 
+另含极大间隙惩罚回归：不可达哨兵必须为负无穷，否则 gap_open=1e20 时合法
+负分 -1e20 会被当作不可达（分段计分漏前驱、规范回溯越界、歧义判定漏
+“可未匹配”结局），见 HugeGapPenaltyTest。
+
 运行：python -m unittest discover -s tests -v
 """
 import unittest
@@ -256,6 +260,107 @@ class LowOpenPenaltyMissingAssignmentTest(unittest.TestCase):
         res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 0.0, 0.0)
         self.assertEqual(res["solution_count"], 6)
         self.assertEqual(res["solutions_listed"], 6)
+
+
+class HugeGapPenaltyTest(unittest.TestCase):
+    """极大间隙惩罚（如 gap_open=1e20）：合法负分不得被当作不可达。
+
+    修复背景：不可达哨兵曾是有限值 -1e18。五项权重全 0、gap_open=1e20 时，
+    最优归属的分值就是合法的 -1e20，比哨兵更负，于是：
+    * 分段计分把合法前驱（FD/gap 边）误判为不可达而跳过，且 NEG-extend 经
+      浮点舍入后仍约等于 NEG，在 max 中反过来污染计分表；
+    * 归属枚举的规范回溯把不可达游程态当成最优，索引越界（API 层即 500）；
+    * 歧义判定的间隙边守卫同样把 -1e20 当不可达，漏掉“可未匹配”结局。
+    哨兵改为真正的负无穷后，任意量级的合法负分都按可达参与比较。
+    """
+
+    def test_2x1_open1e20_returns_two_assignments(self):
+        """任务反例：参考孔两层、待校核孔一层、全零权重、open=1e20/extend=1。
+
+        最优 = 目标层匹配参考孔第一层或第二层（各留一个未匹配参考层，
+        付一次开间隙 -1e20），dp_score=-1e20，计数与列出均为 2。
+        """
+        ref = make_layers([(101, "砂岩"), (102, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 1e20, 1.0)
+        self.assertEqual(res["dp_score"], -1e20)
+        self.assertEqual(res["solution_count"], 2)
+        self.assertEqual(res["solutions_listed"], 2)
+        self.assertEqual(signatures(res), {
+            (((101, 201),), (102,), ()),
+            (((102, 201),), (101,), ()),
+        })
+        # 主解是两个最优归属之一，且恰留一个未匹配参考层
+        primary = (
+            tuple((p["ref_layer_id"], p["hole_layer_id"]) for p in res["pairs"]),
+            tuple(u["layer_id"] for u in res["unmatched_ref"]),
+            tuple(u["layer_id"] for u in res["unmatched_hole"]),
+        )
+        self.assertIn(primary, signatures(res))
+        self.assertEqual(len(res["unmatched_ref"]), 1)
+        self.assertEqual(res["unmatched_hole"], [])
+        # 歧义判定：两个参考层各有“匹配目标层 / 未匹配”两个结局
+        self.assertEqual(len(res["ambiguities"]), 2)
+        for amb in res["ambiguities"]:
+            self.assertTrue(amb["can_be_unmatched"])
+            self.assertEqual(amb["outcome_count"], 2)
+            self.assertEqual(len(amb["partners"]), 1)
+
+    def test_canonical_region_no_crash_under_huge_open(self):
+        """规范回溯在 open=1e20 下不再把不可达游程态当最优（原越界 500）。"""
+        from app.correlator import _canonical_region
+        for a in range(0, 4):
+            for b in range(0, 4):
+                if a == 0 and b == 0:
+                    continue
+                steps = _canonical_region(a, b, 0, 0, 1e20, 1.0)
+                self.assertEqual(sum(1 for s in steps if s[0] == "GA"), a)
+                self.assertEqual(sum(1 for s in steps if s[0] == "GB"), b)
+
+    def test_huge_extend_middle_match_splits_runs(self):
+        """extend=1e20、open=1：匹配中间层把未匹配层拆成两个独立开间隙游程。
+
+        3 层对 1 层：匹配端层要付 open+extend（-1-1e20），匹配中间层只付
+        两次 open（-2），后者严格最优且唯一。
+        """
+        ref = make_layers([(101, "砂岩"), (102, "砂岩"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩")])
+        res = correlate(ref, hole, [], ZERO_WEIGHTS, 5.0, 1.0, 1e20)
+        self.assertEqual(res["dp_score"], -2.0)
+        self.assertEqual(res["solution_count"], 1)
+        self.assertEqual(
+            [tuple(p) for p in res["tie_solutions"][0]["pairs"]], [(102, 201)])
+        self.assertEqual(
+            sorted(res["tie_solutions"][0]["unmatched_ref"]), [101, 103])
+
+    def test_locked_marker_with_huge_open(self):
+        """锁定标志层 + 极大惩罚：分段计分在锚点两侧仍正确。
+
+        3 层对 2 层、中层锁定：锚点后段 1 层对 0 层必须未匹配（-1e20）；
+        锚点前段 1 层对 1 层匹配（0 罚）远优于双未匹配（-2e20）。
+        """
+        ref = make_layers([(101, "砂岩"), (102, "煤层"), (103, "砂岩")])
+        hole = make_layers([(201, "砂岩"), (202, "煤层")])
+        res = correlate(ref, hole, [(1, 1)], ZERO_WEIGHTS, 5.0, 1e20, 1.0)
+        self.assertEqual(res["dp_score"], -1e20)
+        self.assertEqual(res["solution_count"], 1)
+        self.assertEqual(res["solutions_listed"], 1)
+        sol = res["tie_solutions"][0]
+        self.assertIn((102, 202), [tuple(p) for p in sol["pairs"]])
+        self.assertEqual(sol["unmatched_ref"], [103])
+        self.assertEqual(sol["unmatched_hole"], [])
+
+    def test_positive_weights_with_huge_open(self):
+        """默认权重 + 极大惩罚：强信号下全匹配（0 惩罚）仍唯一最优。"""
+        ref = make_layers([(101, "砂岩"), (102, "泥岩")])
+        hole = make_layers([(201, "砂岩"), (202, "泥岩")])
+        res = correlate(ref, hole, [], DEFAULT_SETTINGS["weights"],
+                        5.0, 1e20, 1.0)
+        self.assertEqual(res["solution_count"], 1)
+        self.assertEqual(
+            [(p["ref_layer_id"], p["hole_layer_id"]) for p in res["pairs"]],
+            [(101, 201), (102, 202)])
+        self.assertGreater(res["dp_score"], 0)
 
 
 if __name__ == "__main__":

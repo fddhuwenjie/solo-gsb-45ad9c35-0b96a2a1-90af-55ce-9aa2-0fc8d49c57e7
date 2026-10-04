@@ -27,13 +27,20 @@
   排列多付 extend 而漏掉本可最优的归属。枚举时每个归属用 _canonical_region
   在小 DP 上回溯出唯一一条达到最优代价的规范步骤（并列时优先同侧连跳）。
 
-支持接口允许的全部非负 gap_open/gap_extend 组合（含 open<extend）。
+支持接口允许的全部非负 gap_open/gap_extend 组合（含 open<extend、
+以及 gap_open=1e20 之类的极大惩罚）。
+
+不可达哨兵必须为真正的负无穷：合法分值可以任意负（例如五项权重全 0、
+gap_open=1e20 时，最优归属的分值就是 -1e20）。若用有限哨兵（如 -1e18），
+合法负分会被各处的“<= NEG/2 即不可达”守卫误判，哨兵参与 max 运算还会
+反过来污染计分表（NEG - extend 经浮点舍入后仍约等于 NEG，压过合法分），
+并在规范回溯时把不可达游程态当成最优而索引越界。
 """
 from .domain import (
     lithology_similarity, grain_similarity, water_similarity, elev_similarity,
 )
 
-NEG = -1e18
+NEG = float("-inf")     # 不可达哨兵：任何有限分值（无论多负）都视为可达
 EPS = 1e-7
 MAX_SOLUTIONS = 100
 COUNT_CAP = 9999          # 并列解计数封顶，避免大整数

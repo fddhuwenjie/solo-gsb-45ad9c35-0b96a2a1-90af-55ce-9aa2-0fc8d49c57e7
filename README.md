@@ -26,8 +26,10 @@ python wsgi.py          # http://localhost:8000
 
 核心算法（`app/correlator.py`）不依赖 Flask，可直接运行回归测试
 （含“全零参数下单层对单层只计 2 个并列解”与“低开间隙惩罚 `gap_open=0`、
-`gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”的反例，以及多标志层
-分段锚点组合用例）：
+`gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”的反例、多标志层
+分段锚点组合用例，以及“`gap_open=1e20` 极大惩罚下合法负分 `-1e20` 不被
+当作不可达”的极大惩罚用例）；`tests/test_api.py` 为同一反例的 HTTP 级
+回归（重算不再 500、导出 JSON 与重算一致），需 Flask，本地未安装时自动跳过：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -68,6 +70,56 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 # 期望：solution_count = 6，含一个 pairs=[]、unref=[1,2]、unhole=[1,2] 的“全部未匹配”归属
 ```
 
+### 复现“极大间隙惩罚重算 500”反例
+
+`PUT /api/settings` 允许任意**非负** `gap_open`，包括 `1e20` 之类的极大值。
+五项权重全为 0 时，最优归属的 DP 分就是**合法的负分** `-1e20`（付一次开
+间隙）；若计分 DP 用有限哨兵（如 `-1e18`）表示“不可达”，合法负分会被
+误判不可达、规范回溯随之索引越界，设置虽成功、重算却直接 500。修复后哨兵
+为负无穷，任意量级的合法负分都按可达参与分段计分、归属枚举与歧义判定。
+下面用**独立数据**（先清空演示钻孔与标志层）复现，修复后应返回
+`dp_score=-1e20`、目标层分别匹配参考孔第一层或第二层的 **2 个并列归属**
+（各留一个未匹配参考层），`solution_count` 与 `solutions_listed` 均为 2：
+
+```bash
+docker compose up -d --build
+BASE=http://localhost:8000
+
+# 独立数据：清空内置演示标志层与钻孔
+for id in $(curl -s $BASE/api/state | python3 -c 'import sys,json;print(" ".join(str(m["id"]) for m in json.load(sys.stdin)["markers"]))'); do
+  curl -s -XDELETE $BASE/api/markers/$id >/dev/null
+done
+for id in $(curl -s $BASE/api/state | python3 -c 'import sys,json;print(" ".join(str(b["id"]) for b in json.load(sys.stdin)["boreholes"]))'); do
+  curl -s -XDELETE $BASE/api/boreholes/$id >/dev/null
+done
+
+# 参考孔两层、待校核孔一层
+curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
+  "name":"R","collar_elev":100,"x":0,"layers":[
+    {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9},
+    {"top":2,"bottom":4,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
+curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
+  "name":"H","collar_elev":100,"x":10,"layers":[
+    {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
+
+# 五项权重全 0、极大开间隙惩罚
+curl -s -XPUT $BASE/api/settings -H 'Content-Type: application/json' -d '{
+  "weights":{"lithology":0,"grain":0,"water":0,"elev":0,"confidence":0},
+  "gap_open":1e20,"gap_extend":1}' >/dev/null
+
+# 不锁标志层重算：应返回 200 而非 500
+RID=$(curl -s $BASE/api/state | python3 -c 'import sys,json;print(next(b["id"] for b in json.load(sys.stdin)["boreholes"] if b["name"]=="R"))')
+curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
+  -d "{\"reference_id\":$RID,\"marker_ids\":[]}" \
+| python3 -c 'import sys,json;h=json.load(sys.stdin)["holes"][0];print("dp_score =",h["dp_score"]);print("solution_count =",h["solution_count"],"solutions_listed =",h["solutions_listed"]);[print(s["pairs"],"unref",s["unmatched_ref"],"unhole",s["unmatched_hole"]) for s in h["tie_solutions"]]'
+# 期望：dp_score = -1e+20，solution_count = solutions_listed = 2；
+# 两个归属分别为 pairs=[[R1,H1]] unref=[R2] 与 pairs=[[R2,H1]] unref=[R1]
+#（R1/R2/H1 为实际层 id）
+
+# 导出 JSON 与重算结果口径一致
+curl -s $BASE/api/export | python3 -c 'import sys,json;h=json.load(sys.stdin)["last_result"]["holes"][0];print("export dp_score =",h["dp_score"],"count =",h["solution_count"],"listed =",h["solutions_listed"])'
+```
+
 ## 功能
 
 - **数据录入**：多口钻孔的孔口高程、水平位置（剖面坐标），以及按深度排列的岩性层段
@@ -91,7 +143,9 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
     每个归属以其**可达最高 DP 分**参与比较；计数与枚举在“匹配节点 + 间隙区”上按归属
     进行，每个归属唯一对应一条规范步骤，多标志层分段组合再按同一签名兜底去重，
     `solution_count` 与 `solutions_listed` 口径一致（支持 `gap_open < gap_extend` 等
-    接口允许的全部非负惩罚组合）；
+    接口允许的全部非负惩罚组合）；计分 DP 的“不可达”哨兵为负无穷，
+    `gap_open=1e20` 之类的极大惩罚产生的合法负分（如 `-1e20`）不会被误判
+    不可达，分段计分、归属枚举与歧义判定在任意量级惩罚下保持一致；
   - 并列解计数封顶 9999，并列方案枚举最多列出前 100 条，可在结果区弹窗逐方案查看。
 - **剖面图**：SVG 绘制统一高程的钻孔柱状，连线颜色区分普通匹配 / 标志层锚点 / 歧义候选，
   未匹配层标红叉，悬停层块查看属性，可开关歧义带与相似度标注。
@@ -133,7 +187,7 @@ app/
   seed.py         内置演示数据
   routes.py       Flask 路由
   static/         index.html / style.css / app.js（原生前端，SVG 剖面）
-tests/            并列解计数口径回归测试（unittest，无需 Flask）
+tests/            并列解计数口径 + 极大间隙惩罚回归（unittest；API 级用例需 Flask，无则跳过）
 wsgi.py           开发入口 & gunicorn 入口
 Dockerfile / docker-compose.yml
 ```
