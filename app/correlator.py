@@ -28,15 +28,33 @@
   在小 DP 上回溯出唯一一条达到最优代价的规范步骤（并列时优先同侧连跳）。
 
 支持接口允许的全部非负 gap_open/gap_extend 组合（含 open<extend）。
+接口只校验惩罚非负，取值可以任意大（如 1e20）：此时合法的最优分值本身
+可能是绝对值极大的负数（如 -1e20）。不可达哨兵必须严格小于任何可达
+分值，故使用真正的负无穷（不可达状态参与 max/加减时自然被淘汰，且不会
+被四舍五入进导出 JSON）；最优性比较使用随分值尺度缩放的容差，避免把
+“绝对值极大的合法负分”误判为不可达，也避免在大分值上按固定 1e-5 做
+等同比较时漏判本应并列的方案。
 """
+import math
+
 from .domain import (
     lithology_similarity, grain_similarity, water_similarity, elev_similarity,
 )
 
-NEG = -1e18
-EPS = 1e-7
+NEG = float("-inf")
+# 并列判定容差：固定绝对容差兜底小分值下的浮点舍入，相对容差覆盖大尺度
+# （1e20 量级时固定容差已无意义，该量级 ULP 约 1.6e4，故相对容差取 1e-9）。
+TOL_ABS = 1e-7
+TOL_REL = 1e-9
 MAX_SOLUTIONS = 100
 COUNT_CAP = 9999          # 并列解计数封顶，避免大整数
+
+
+def close(a, b, atol=TOL_ABS, rtol=TOL_REL):
+    """尺度感知的近似相等：不可达（-inf）只与 -inf 相等。"""
+    if math.isinf(a) or math.isinf(b):
+        return a == b
+    return abs(a - b) <= atol + rtol * max(abs(a), abs(b))
 
 
 def elevation_layer(layer, collar_elev):
@@ -130,7 +148,11 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
     _c, lH, lV = _gap_cost_table(gap_open, gap_extend, a, b)
     steps = []
     x, y = a, b
-    state = "H" if lH[x][y] >= lV[x][y] - EPS else "V"
+    # 末态只在“该态真的可达”的候选中按分值选择（并列优先 H：同侧连跳、
+    # 游程数最少）；不可达为 -inf，不可选到 x=0 的 H 或 y=0 的 V。
+    h_ok, v_ok = math.isfinite(lH[x][y]), math.isfinite(lV[x][y])
+    assert h_ok or v_ok, "间隙区终点不可达（不应出现：调用方只回溯最优区）"
+    state = "H" if h_ok and (not v_ok or lH[x][y] >= lV[x][y] - TOL_ABS) else "V"
     while x > 0 or y > 0:
         if state == "H":
             cont = lH[x-1][y] - gap_extend
@@ -138,9 +160,9 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
             start = -gap_open if (x == 1 and y == 0) else NEG
             best = max(cont, switch, start)
             steps.append(("GA", p + x, 0))
-            if abs(cont - best) <= EPS:
+            if math.isfinite(cont) and close(cont, best):
                 state = "H"
-            elif abs(switch - best) <= EPS:
+            elif math.isfinite(switch) and close(switch, best):
                 state = "V"
             else:
                 state = "D"
@@ -151,9 +173,9 @@ def _canonical_region(a, b, p, q, gap_open, gap_extend):
             start = -gap_open if (x == 0 and y == 1) else NEG
             best = max(cont, switch, start)
             steps.append(("GB", 0, q + y))
-            if abs(cont - best) <= EPS:
+            if math.isfinite(cont) and close(cont, best):
                 state = "V"
-            elif abs(switch - best) <= EPS:
+            elif math.isfinite(switch) and close(switch, best):
                 state = "H"
             else:
                 state = "D"
@@ -254,24 +276,27 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
             for p in range(i):
                 for q in range(j):
                     pv = FD[p][q]
-                    if pv <= NEG / 2:
+                    if not math.isfinite(pv):
                         continue
                     # (p,q) 匹配后跳过 A 的 p+1..i-1、B 的 q+1..j-1
                     val = pv + gcost[(i - p - 1, j - q - 1)] + s
-                    if val > best + EPS:
+                    # best 初值 -inf：有限 val 恒严格优于 -inf
+                    if not math.isfinite(best):
                         best, cnt = val, CD[p][q]
-                    elif abs(val - best) <= EPS:
-                        cnt = min(COUNT_CAP, cnt + CD[p][q])
+                    elif val > best and not close(val, best):
+                        best, cnt = val, CD[p][q]       # 严格更大：替换
+                    elif close(val, best):
+                        cnt = min(COUNT_CAP, cnt + CD[p][q])  # 容差内：并列
             FD[i][j], CD[i][j] = best, cnt
 
     # 段尾虚节点 (n,m) 的纯间隙收尾：最后匹配 (p,q) 后跳过 p+1..n、q+1..m
     total_count = 0
     for p in range(n + 1):
         for q in range(m + 1):
-            if FD[p][q] <= NEG / 2:
+            if not math.isfinite(FD[p][q]):
                 continue
             val = FD[p][q] + gcost[(n - p, m - q)]
-            if abs(val - total) <= 1e-5:
+            if close(val, total):
                 total_count = min(COUNT_CAP, total_count + CD[p][q])
 
     # ---- 判定每条匹配边 (i,j) 是否在某条最优路径上 ----
@@ -280,7 +305,7 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
     for i in range(1, n + 1):
         for j in range(1, m + 1):
             pre = max(D[i-1][j-1], H[i-1][j-1], V[i-1][j-1])
-            on_path = abs(pre + sim[(i, j)] + RD[i][j] - total) <= 1e-5
+            on_path = close(pre + sim[(i, j)] + RD[i][j], total)
             if on_path:
                 match_edges[(i, j)] = True
                 match_partners[i].add(j)
@@ -296,9 +321,9 @@ def _align_segment(A, B, sim, gap_open, gap_extend):
                 D[i-1][j] - gap_open,
                 V[i-1][j] - gap_open,
             )
-            if best <= NEG / 2:
+            if not math.isfinite(best):
                 continue
-            if abs(best + RH[i][j] - total) <= 1e-5:
+            if close(best + RH[i][j], total):
                 gap_positions[i].add(0)
 
     # ---- 主解回溯（偏好：间隙区尽量小 = 尽量多匹配）----
@@ -332,14 +357,14 @@ def _best_region_predecessor(i, j, FD, gcost, target, real_match,
     cands = []
     for p in range(i + 1):
         for q in range(j + 1):
-            if FD[p][q] <= NEG / 2:
+            if not math.isfinite(FD[p][q]):
                 continue
             if real_match and (p >= i or q >= j):
                 continue
             a = i - p - 1 if real_match else i - p
             b = j - q - 1 if real_match else j - q
             val = FD[p][q] + gcost[(a, b)] + (sim_score if real_match else 0.0)
-            if abs(val - target) <= EPS:
+            if close(val, target):
                 cands.append((p, q, a + b))
     cands.sort(key=lambda t: (t[2], -t[0], -t[1]))
     return cands[0][0], cands[0][1]
@@ -360,7 +385,7 @@ def _build_primary_steps(n, m, sim, FD, gcost, total,
         return []
     # 段尾：优先“匹配到 (n,m)”收尾（真实匹配节点，real_match=True），
     # 否则以纯间隙收尾（虚节点，real_match=False）
-    match_end = FD[i][j] > NEG / 2 and abs(FD[i][j] - total) <= 1e-5
+    match_end = math.isfinite(FD[i][j]) and close(FD[i][j], total)
     if match_end:
         p, q = _best_region_predecessor(
             i, j, FD, gcost, FD[i][j], True, sim[(i, j)])
@@ -422,14 +447,14 @@ def _enum_segment_paths(seg, limit=MAX_SOLUTIONS):
             for nj in range(j + 1, m + 1):
                 a, b = ni - i - 1, nj - j - 1
                 base = prefix + gcost[(a, b)] + sim[(ni, nj)]
-                if abs(base - FD[ni][nj]) <= EPS and \
-                        abs(FD[ni][nj] + seg["RD"][ni][nj] - total) <= 1e-5:
+                if close(base, FD[ni][nj]) and \
+                        close(FD[ni][nj] + seg["RD"][ni][nj], total):
                     region = _canonical_region(a, b, i, j, go, ge)
                     out.append((ni, nj, region + [("M", ni, nj)], True))
         # 段尾 (n,m) 纯间隙收尾：跳过 n-i / m-j 层，不产生匹配
         a, b = n - i, m - j
         if a > 0 or b > 0:
-            if abs(prefix + gcost[(a, b)] - total) <= 1e-5:
+            if close(prefix + gcost[(a, b)], total):
                 region = _canonical_region(a, b, i, j, go, ge)
                 out.append((n, m, region, False))
         # 主解优先：匹配收尾在前；间隙区小（匹配多）在前；顺序确定

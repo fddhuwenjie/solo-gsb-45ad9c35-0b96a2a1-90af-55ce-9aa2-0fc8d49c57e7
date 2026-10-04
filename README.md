@@ -25,12 +25,56 @@ python wsgi.py          # http://localhost:8000
 ### 运行测试
 
 核心算法（`app/correlator.py`）不依赖 Flask，可直接运行回归测试
-（含“全零参数下单层对单层只计 2 个并列解”与“低开间隙惩罚 `gap_open=0`、
-`gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”的反例，以及多标志层
-分段锚点组合用例）：
+（含“全零参数下单层对单层只计 2 个并列解”、“低开间隙惩罚 `gap_open=0`、
+`gap_extend=1` 下 2×2 应得 6 个归属、不漏全部未匹配”与“极大开间隙惩罚
+`gap_open=1e20` 下合法负分 `-1e20` 不被当作不可达、2×1 应得 2 个归属”
+三类反例，以及多标志层分段锚点组合用例；另含一个端到端 HTTP 用例，
+无 Flask 时自动跳过）：
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+### 复现“极大间隙惩罚把合法负分误判为不可达”反例
+
+`PUT /api/settings` 允许任意**非负** `gap_open` / `gap_extend` 组合，取值
+可以任意大（如 `1e20`）。当五项相似度权重全为 0、参考孔两层、待校核孔
+一层且不锁标志层时，待校核层无论匹配参考孔第一层还是第二层，都恰好有一个
+参考层未匹配（开一个间隙游程），最优分值是合法的负数 `-1e20`。旧实现以
+`-1e18` 作“不可达”哨兵，`-1e20` 比哨兵更负，可达状态被当成不可达、DP 表
+被幻影值污染，`POST /api/correlate` 在规范回溯时直接报 500。修复后哨兵
+为真正的负无穷、最优性比较按分值尺度缩放，下面的独立数据调用应得到
+**`dp_score=-1e20`、两个并列归属（各留一个未匹配参考层）**，
+`solution_count` 与 `solutions_listed` 均为 2，不再返回 500：
+
+```bash
+docker compose up -d --build
+BASE=http://localhost:8000
+
+# 独立数据：参考孔两层、待校核孔一层（属性相同）
+curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
+  "name":"R","collar_elev":100,"x":0,"layers":[
+    {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9},
+    {"top":2,"bottom":4,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
+curl -s -XPOST $BASE/api/boreholes -H 'Content-Type: application/json' -d '{
+  "name":"H","collar_elev":100,"x":10,"layers":[
+    {"top":0,"bottom":2,"lithology":"砂岩","grain":"中粒","water":"稍湿","confidence":0.9}]}' >/dev/null
+
+# 五项权重全 0、极大开间隙惩罚
+curl -s -XPUT $BASE/api/settings -H 'Content-Type: application/json' -d '{
+  "weights":{"lithology":0,"grain":0,"water":0,"elev":0,"confidence":0},
+  "gap_open":1e20,"gap_extend":1}' >/dev/null
+
+RID=$(curl -s $BASE/api/state | python3 -c 'import sys,json;print(next(b["id"] for b in json.load(sys.stdin)["boreholes"] if b["name"]=="R"))')
+# 不锁标志层：marker_ids 留空
+curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
+  -d "{\"reference_id\":$RID,\"marker_ids\":[]}" \
+| python3 -c 'import sys,json;h=json.load(sys.stdin)["holes"][0];print("dp_score =",h["dp_score"],"| solution_count =",h["solution_count"],"| solutions_listed =",h["solutions_listed"]);[print(s["pairs"],"unref",s["unmatched_ref"],"unhole",s["unmatched_hole"]) for s in h["tie_solutions"]]'
+# 期望：
+#   dp_score = -1e+20 | solution_count = 2 | solutions_listed = 2
+#   [(<R1 的 id>, <H1 的 id>)] unref [<R2 的 id>] unhole []
+#   [(<R2 的 id>, <H1 的 id>)] unref [<R1 的 id>] unhole []
+# 「导出 JSON」(GET /api/export) 的 last_result 与重算结果口径一致。
 ```
 
 ### 复现“低开间隙惩罚漏解”反例
@@ -78,8 +122,9 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
 - **带间隙惩罚的动态规划**：
   - 层间相似度 = 岩性 / 粒径 / 含水状态 / 高程接近度（指数衰减）/ 置信度五项加权；
   - 三态 DP（匹配态、参考孔间隙态、待校核孔间隙态）实现**仿射间隙代价**（开间隙 `gap_open`、续间隙 `gap_extend`），
-    保持层序单调、允许尖灭/缺失/新增层；
-  - 总分按 `匹配相似度之和 / max(两孔层数) × 100` 归一化。
+    保持层序单调、允许尖灭/缺失/新增层；不可达哨兵为真正的负无穷，合法的负最优分
+    （如 `gap_open=1e20` 下的 `-1e20`）不会被误判为不可达；
+  - 总分按 `匹配相似度之和 / max(两孔层数) × 100` 归一化（`dp_score` 为未归一化的 DP 原始分）。
 - **输出**：相关层带（匹配对及五项相似度明细）、未匹配层（参考孔侧/待校核孔侧分列）、
   锚点对、总分与多孔平均分。
 - **并列解与歧义区间**：正/反 DP 表联合判定每条边是否出现在某条最优路径上，
@@ -90,8 +135,8 @@ curl -s -XPOST $BASE/api/correlate -H 'Content-Type: application/json' \
     多付续间隙惩罚而漏判——最优分值由不受限 Gotoh DP（允许两侧间隙游程交错）计算，
     每个归属以其**可达最高 DP 分**参与比较；计数与枚举在“匹配节点 + 间隙区”上按归属
     进行，每个归属唯一对应一条规范步骤，多标志层分段组合再按同一签名兜底去重，
-    `solution_count` 与 `solutions_listed` 口径一致（支持 `gap_open < gap_extend` 等
-    接口允许的全部非负惩罚组合）；
+    `solution_count` 与 `solutions_listed` 口径一致（支持 `gap_open < gap_extend`、
+    惩罚取值任意大等接口允许的全部非负惩罚组合）；
   - 并列解计数封顶 9999，并列方案枚举最多列出前 100 条，可在结果区弹窗逐方案查看。
 - **剖面图**：SVG 绘制统一高程的钻孔柱状，连线颜色区分普通匹配 / 标志层锚点 / 歧义候选，
   未匹配层标红叉，悬停层块查看属性，可开关歧义带与相似度标注。
